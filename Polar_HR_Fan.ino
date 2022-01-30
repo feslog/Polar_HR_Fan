@@ -17,6 +17,7 @@
 #include "BLEDevice.h"
 #include <Wire.h>
 #include <M5StickC.h>
+#include "AXP192.h"
 #include <elapsedMillis.h>
 
 /* UUID's of the service, characteristic that we want to read*/
@@ -381,6 +382,14 @@ void loop() {
   }
 
   myOldState = myState;
+
+  // shut down if external power is removed. no need to operate on battery
+  // https://github.com/m5stack/m5-docs/blob/master/docs/en/api/axp192_m5stickc.md
+  //while ((M5.Axp.GetVinVoltage() < 3.0) && (M5.Axp.GetVBusVoltage() < 3.0)) {
+  //  M5.Axp.DeepSleep(SLEEP_SEC(15));  //M5.Axp.PowerOff();
+  //}
+  if ((M5.Axp.GetVinVoltage() < 3.0) && (M5.Axp.GetVBusVoltage() < 3.0))
+    M5.Axp.PowerOff();
   
   delay(1000); // Delay a second between loops.
 }

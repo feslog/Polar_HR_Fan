@@ -1,6 +1,12 @@
 /*********
 
+  Controls the speed of a fan based on heartrate of a detected BLE heartrate band
 
+  The fan interface is an opto-coupler that essentially simulates a button push on the fan itself.
+    This fan turns off when the button is held for > 2 seconds
+    Subsequent button presses cycles through the speeds H-M-L
+    To set speeds, this code always turns the fan off and then presses the button additional times to set the desired speed
+    
   Adapted from:
     Rui Santos
     Complete instructions at https://RandomNerdTutorials.com/esp32-ble-server-client/
@@ -11,7 +17,7 @@
 #include "BLEDevice.h"
 #include <Wire.h>
 #include <M5StickC.h>
-
+#include <elapsedMillis.h>
 
 /* UUID's of the service, characteristic that we want to read*/
 // BLE Service
@@ -39,13 +45,34 @@ const uint8_t notificationOff[] = {0x0, 0x0};
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 
+#define FAN_OUT 0 // Fan is connected to pin G0
+#define BUTTON_NOT_PRESSED 0
+#define BUTTON_PRESSED 1
 
-//Variables to store temperature and humidity
-char* heartRateChar;
-
+//Variable to store heartrate
+uint8_t heartRate = 0;
 
 //Flags to check whether new temperature and humidity readings are available
 boolean newHeartRate = false;
+
+BLEDevice* pBLEDevice;
+BLEScan* pBLEScan;
+
+// device states
+enum state {stInit, stIdle, stScanning, stConnected};
+enum state myState = stIdle;
+enum state myOldState = stInit;
+
+// fan speeds
+enum fanSpeeds {fsInit, fsOff, fsLow, fsMed, fsHigh};
+enum fanSpeeds fanSpeed = fsOff;
+enum fanSpeeds fanLastSpeed = fsInit;
+
+// fan timer to prevent from changing speeds too often
+elapsedMillis msSinceFanChange;
+
+
+void startScan();
 
 class MyClientCallback : public BLEClientCallbacks {
   void onConnect(BLEClient* pclient) {
@@ -54,6 +81,8 @@ class MyClientCallback : public BLEClientCallbacks {
   void onDisconnect(BLEClient* pclient) {
     connected = false;
     Serial.println("onDisconnect");
+    myState = stIdle;
+    
   }
 };
 
@@ -105,7 +134,7 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
       pServerAddress = new BLEAddress(advertisedDevice.getAddress()); //Address of advertiser is the one we need
       doConnect = true; //Set indicator, stating that we are ready to connect
       Serial.println("Device found. Connecting!");
-    }
+    } 
   }
 };
 
@@ -134,8 +163,10 @@ static void heartRateNotifyCallback(BLERemoteCharacteristic* pBLERemoteCharacter
   //boolean contactSupported = status & (1 << 1);
   //boolean contactDetected = status & (1 << 2);
 
-  heartRateChar = (char*)pData[1];
-  newHeartRate = true;
+  if ((pData[1] > 0) && (heartRate != pData[1])) {  // ignore values of 0 and unchanged values
+    heartRate = (uint8_t)pData[1];
+    newHeartRate = true;
+  }
 
   Serial.print("Notify callback for characteristic ");
   for (int i = 0; i < length; i++) {
@@ -147,26 +178,120 @@ static void heartRateNotifyCallback(BLERemoteCharacteristic* pBLERemoteCharacter
 
 
 //function that prints the latest sensor readings in the OLED display
-void printReadings(){
+void updateDisplay(){
 
-  char tmp[12];
-  sprintf(tmp,"%u",heartRateChar);
-
-  M5.Lcd.fillScreen(BLACK);
+  M5.Lcd.fillScreen(TFT_BLACK);
   M5.Lcd.setTextSize(1);
+  M5.Lcd.setTextColor(TFT_WHITE);
   M5.Lcd.setCursor(0,0);
-  M5.Lcd.print("HR: ");
-  M5.Lcd.setTextSize(3);
-  M5.Lcd.setCursor(0,10);
-  M5.Lcd.println(tmp);
+  
+  switch (myState) {
+    case stIdle:
+      M5.Lcd.println("Idle");
+      break;
+    case stScanning:
+      M5.Lcd.println("Scanning");
+      break;
+    case stConnected:
+      M5.Lcd.println("Connected");
+      M5.Lcd.setCursor(0,12);
+      M5.Lcd.print("HR:");
+      M5.Lcd.setTextSize(3);
+      M5.Lcd.setCursor(0,30);
+      M5.Lcd.println(heartRate);
+    
+      Serial.print("HR: ");
+      Serial.println(heartRate);      
+      break;
+    default:
+      break;
+  }
 
-  Serial.print("HR:");
-  Serial.println(tmp);
+  // always show fan speed
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setCursor(0,85);
+  M5.Lcd.println("FAN SPEED:");
+  M5.Lcd.setTextSize(4);
+  M5.Lcd.setCursor(15,100);  // warning, attempts to set x=20 caused the "M" not to print below - strange bug?
+  switch (fanSpeed) {
+    case fsOff:
+      M5.Lcd.setTextColor(TFT_BLUE);
+      M5.Lcd.println("0");
+      break;
+    case fsLow:
+      M5.Lcd.setTextColor(TFT_YELLOW);
+      M5.Lcd.println("L");
+      break;
+    case fsMed:
+      M5.Lcd.setTextColor(TFT_ORANGE);
+      M5.Lcd.println("M");
+      break;
+    case fsHigh:
+      M5.Lcd.setTextColor(TFT_RED);
+      M5.Lcd.println("H");
+      break;      
+    default:
+      break;
+  }
+      
 }
 
+
+void startScan() {
+  // Retrieve a Scanner and set the callback we want to use to be informed when we
+  // have detected a new device.  Specify that we want active scanning
+  if (!pBLEScan) { 
+    pBLEScan = pBLEDevice->getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    pBLEScan->setActiveScan(true);
+    // Start the scan to run for 30 seconds.
+    Serial.println("Starting scan");
+  } else {
+    Serial.println("Re-starting scan");
+  }
+  pBLEScan->clearResults();  // clear previous results to force redetection  
+  pBLEScan->start(5, false);  
+
+}
+
+void setFanSpeed(){
+
+  char presses = 0;
+  
+  // always start with the fan off
+  digitalWrite(FAN_OUT,BUTTON_PRESSED);
+  delay(3000);
+  digitalWrite(FAN_OUT,BUTTON_NOT_PRESSED);
+  
+  switch (fanSpeed) {
+    case fsOff:
+      presses = 0;
+      break;
+    case fsLow:
+      presses = 3;      
+      break;
+    case fsMed:
+      presses = 2;
+      break;
+    case fsHigh:
+      presses = 1;
+      break;      
+    default:
+      // statements
+      break;
+  }
+
+  for (int i=1; i <= presses; i++) {
+    delay(250);
+    digitalWrite(FAN_OUT,BUTTON_PRESSED);
+    delay(250);
+    digitalWrite(FAN_OUT,BUTTON_NOT_PRESSED);    
+  }
+}
+  
 void setup() {
 
-  M5.Lcd.fillScreen(BLACK);
+  M5.Lcd.fillScreen(TFT_BLACK);
   M5.Lcd.setTextSize(2);
   M5.Lcd.setTextColor(TFT_YELLOW);
   M5.Lcd.setCursor(0,0,2);
@@ -178,20 +303,25 @@ void setup() {
 
   // Setup display
   M5.begin();
+
+  // Init fan control pin
+  pinMode(FAN_OUT, OUTPUT);
+  digitalWrite(FAN_OUT,BUTTON_NOT_PRESSED);  
   
   //Init BLE device
-  BLEDevice::init("");
- 
-  // Retrieve a Scanner and set the callback we want to use to be informed when we
-  // have detected a new device.  Specify that we want active scanning and start the
-  // scan to run for 30 seconds.
-  BLEScan* pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setActiveScan(true);
-  pBLEScan->start(30);
+  pBLEDevice = new BLEDevice;
+  pBLEDevice->init("");
+
+
 }
 
 void loop() {
+
+  if (myState == stIdle) {
+    startScan();
+    myState == stScanning;
+  }
+  
   // If the flag "doConnect" is true then we have scanned for and found the desired
   // BLE Server with which we wish to connect.  Now we connect to it.  Once we are
   // connected we set the connected flag to be true.
@@ -201,6 +331,8 @@ void loop() {
       //Activate the Notify property of each Characteristic
       heartRateCharacteristic->getDescriptor(BLEUUID((uint16_t)0x2902))->writeValue((uint8_t*)notificationOn, 2, true);
       connected = true;
+      myState = stConnected;
+      pBLEScan->stop();
       doConnect = false;
     } else {
       Serial.println("We have failed to connect to the server; Restart your device to scan for nearby BLE server again.");
@@ -208,18 +340,47 @@ void loop() {
     
   }
 
-  // check if still connected
- // if (connected) {
- //   if(!BLEDevice::connected()) {
- //     connected = false
- //     Serial.println("We are now disconnected");
- //   }  
- // }
-  
-  //if new temperature readings are available, print in the OLED
-  if (newHeartRate){
-    newHeartRate = false;
-    printReadings();
+  //if new temperature readings are available, display it
+  if (newHeartRate || (myOldState != myState)) {
+    updateDisplay();
   }
+
+  // control fan based on heart rate when connected, otherwise turn or keep it off
+  // but don't change the fan more than once every 15s
+  if (myState == stConnected)  {
+    if (newHeartRate){
+      newHeartRate = false;
+      if (msSinceFanChange > 15000) {
+        if (heartRate > 130)
+          fanSpeed = fsHigh;
+        else if (heartRate > 115)
+          fanSpeed = fsMed;
+        else if (heartRate > 100)
+          fanSpeed = fsLow;
+        else
+          fanSpeed = fsOff;
+      }
+    }
+  }
+  else
+    fanSpeed = fsOff;
+ 
+  Serial.print(msSinceFanChange);
+  Serial.print(" ");
+  Serial.print(fanLastSpeed);
+  Serial.print(" ");
+  Serial.println(fanSpeed);
+  
+  // change fan speed if needed
+  if (fanLastSpeed != fanSpeed)  {
+    updateDisplay();
+    setFanSpeed();
+    msSinceFanChange = 0;
+    fanLastSpeed = fanSpeed;
+ 
+  }
+
+  myOldState = myState;
+  
   delay(1000); // Delay a second between loops.
 }
